@@ -32,20 +32,44 @@ Because `operatorUUID` is a fixed identifier for Easybet's organization
 (not a session token -- it doesn't expire or rotate per request), it's
 hardcoded as EASYBET_ORG_UUID rather than rediscovered on every poll.
 
-Sports covered: soccer (`filter.sports=football`) and rugby
-(`filter.sports=rugby`) -- South Africa's #1 and #2 sports by
-popularity. The rugby value was found the same way as `football`: a
-plain GET to the events endpoint with `filter.sports=rugby` returns
-HTTP 200 with real fixtures (`fixture.sport == "rugby"`, e.g. Top 14
-matches); other plausible slugs (`rugby-union`, `rugby_union`,
-`rugbyunion`, `rugby-league`) all 400 with the API's own
+Sports covered: soccer (`filter.sports=football`), rugby
+(`filter.sports=rugby`) and cricket (`filter.sports=cricket`) --
+South Africa's #1, #2 and #3 sports by popularity. The rugby and
+cricket values were both found the same way as `football`: a plain GET
+to the events endpoint with the candidate slug. `rugby` returned HTTP
+200 with real fixtures (`fixture.sport == "rugby"`, e.g. Top 14
+matches) on the first try; other plausible slugs (`rugby-union`,
+`rugby_union`, `rugbyunion`, `rugby-league`) all 400 with the API's own
 "invalid sport <value>" schema error, confirming `rugby` is the one
-real value, discovered the same low-effort way as every other query
-param on this endpoint rather than needing the JS-bundle/sports-list
-discovery path. Every rugby fixture inspected (30 live events, one full
-page) uses the exact same `winner3` three-way 1X2 market as soccer --
-rugby union matches can end in a draw, so AdvBet doesn't special-case a
-two-way market for it -- so no separate market-mapping path was needed.
+real value. `cricket` also returned HTTP 200 directly on the first try
+(46 live fixtures, e.g. CSA T20 Challenge and various international
+ODI series), so no alternate slug needed to be tried.
+
+Market shape differs by sport, though. Every rugby fixture inspected
+(30 live events, one full page) uses the exact same `winner3` three-way
+1X2 market as soccer -- rugby union matches can end in a draw, so
+AdvBet doesn't special-case a two-way market for it. Cricket does NOT
+follow that pattern: no cricket fixture in a full live page (46 events)
+carried a plain `winner3` market at all. Instead:
+
+- Limited-overs cricket (T20, ODI, T10 -- 44 of 46 fixtures inspected,
+  covering domestic T20 leagues and ODI series) uses `winner2-incl-overtime`,
+  a genuinely two-way market (`options` only has `home`/`away` keys, no
+  `draw` key present at all -- there's no rain-out/tie provision modeled
+  here). This is the moneyline-equivalent market mapped below, the same
+  role `winner3` plays for soccer/rugby.
+- Multi-day cricket (first-class/Test-length matches -- the only 2 of
+  46 fixtures inspected, "Presidents Trophy" and a first-class India A
+  vs Australia A series) instead carries `winner-draw-no-bet` and no
+  `winner2-incl-overtime` at all. That's a genuinely different betting
+  product (stake refunded on a draw, not a priced third outcome) rather
+  than a same-shape three-way market like rugby's, so it's deliberately
+  left unmapped here -- same as `double-chance` and every other
+  non-moneyline market type, out of scope for now rather than worked
+  around. This means Test/first-class cricket fixtures are silently
+  skipped by to_odds_events (no known moneyline-shaped market found for
+  them), the same code path already used for any event whose only
+  markets aren't in MONEYLINE_MARKET_TYPES.
 """
 
 import asyncio
@@ -78,28 +102,48 @@ DEFAULT_POLL_INTERVAL_SECONDS = 45
 
 # AdvBet's market type key -> universal market key, per the plan's
 # market-mapping approach (scanner-engine/formatting.py does the same for
-# other bookmakers). "winner3" is the standard three-way 1X2/moneyline
-# market (home/draw/away); AdvBet exposes hundreds of other market types
+# other bookmakers). AdvBet exposes hundreds of other market types
 # (totals, handicaps, BTTS, etc.) per event, out of scope for now, same
 # as Betway ZA and WSB only handling their moneyline-equivalent market.
-# Rugby uses this exact same "winner3" market (not a separate two-way
-# market) -- a rugby union match can end in a draw, so AdvBet models it
-# with the same three-way options soccer uses, just a much longer-shot
-# draw price. No rugby-specific market key was found in any live fixture
-# inspected, so one map covers both sports.
+#
+# "winner3" is the standard three-way 1X2/moneyline market (home/draw/away)
+# soccer and rugby both use -- a rugby union match can end in a draw, so
+# AdvBet models it with the same three-way options soccer uses, just a
+# much longer-shot draw price. No rugby-specific market key was found in
+# any live fixture inspected.
+#
+# Cricket does not use "winner3" at all (see the module docstring) --
+# limited-overs cricket's moneyline-equivalent is the two-way
+# "winner2-incl-overtime" market instead (no draw key in its options).
+# Both map to the same universal "moneyline" key; which one a given
+# fixture actually carries is resolved by MONEYLINE_MARKET_TYPES below.
 MARKET_TYPE_MAP = {
     "winner3": "moneyline",
+    "winner2-incl-overtime": "moneyline",
 }
+
+# The AdvBet market type keys that represent a "moneyline" market, in the
+# order to check for on a given fixture -- a fixture is expected to carry
+# at most one of these. "winner3" first since that's the three-way market
+# soccer/rugby (and, hypothetically, a future 3-way cricket format) use;
+# "winner2-incl-overtime" is cricket's own two-way equivalent. A fixture
+# with neither (e.g. multi-day/Test-length cricket, which instead carries
+# "winner-draw-no-bet" -- a different betting product, not a same-shape
+# market, see the module docstring) is skipped, same as any other event
+# missing a moneyline-shaped market.
+MONEYLINE_MARKET_TYPES: tuple[str, ...] = ("winner3", "winner2-incl-overtime")
 
 # AdvBet's sport slug -> universal sport name used by the other bookmaker
 # adapters in this project (both Betway ZA and WSB report "soccer").
-# "rugby" is left as an identity mapping (AdvBet's own slug already
-# matches the universal name we want) but spelled out explicitly rather
-# than relying on the fallback, in case AdvBet ever splits it into
-# separate union/league/sevens slugs.
+# "rugby" and "cricket" are left as identity mappings (AdvBet's own slugs
+# already match the universal names we want) but spelled out explicitly
+# rather than relying on the fallback, in case AdvBet ever splits either
+# into more specific slugs (union/league/sevens for rugby, T20/ODI/Test
+# for cricket).
 SPORT_NAME_MAP = {
     "football": "soccer",
     "rugby": "rugby",
+    "cricket": "cricket",
 }
 
 # The sports this adapter polls every cycle. Each is fetched with its own
@@ -109,9 +153,10 @@ SPORT_NAME_MAP = {
 # page of `cursor.limit` (max 100) events ranked with no per-sport
 # guarantee -- with ~1100+ live football fixtures against ~30 rugby ones,
 # a combined request's first page is almost entirely football and starves
-# rugby out. Separate per-sport requests, each within its own 100-event
-# page, is what actually gets both sports' data.
-EASYBET_SPORTS: tuple[str, ...] = ("football", "rugby")
+# the smaller sports out. Separate per-sport requests, each within its
+# own 100-event page, is what actually gets every sport's data -- cricket
+# (46 fixtures in its own full page) follows the same reasoning.
+EASYBET_SPORTS: tuple[str, ...] = ("football", "rugby", "cricket")
 
 
 class EasybetScraper(BaseScraper):
@@ -138,11 +183,14 @@ class EasybetScraper(BaseScraper):
 
     def to_odds_events(self, raw: dict) -> list[OddsEvent]:
         """Maps AdvBet's fixture/betting event shape onto the universal
-        OddsEvent schema. Moneyline (winner3) market only for now. Sport
-        agnostic -- it reads each fixture's own `sport` field (via
-        SPORT_NAME_MAP) rather than trusting which `self.sports` entry the
-        caller happened to fetch, so it works the same for a football or a
-        rugby raw payload.
+        OddsEvent schema. Moneyline market only for now -- resolved via
+        MONEYLINE_MARKET_TYPES since the actual market type key differs by
+        sport ("winner3" for soccer/rugby, "winner2-incl-overtime" for
+        limited-overs cricket; see the module docstring). Sport agnostic --
+        it reads each fixture's own `sport` field (via SPORT_NAME_MAP)
+        rather than trusting which `self.sports` entry the caller happened
+        to fetch, so it works the same for a football, rugby or cricket raw
+        payload.
 
         The response's top-level `tournaments` array is a lookup table
         (by uuid, not filtered to only the events in this page) used to
@@ -179,7 +227,9 @@ class EasybetScraper(BaseScraper):
                 if betting.get("hidden") or betting.get("suspended"):
                     continue
 
-                market = betting.get("markets", {}).get("winner3")
+                markets_raw = betting.get("markets", {})
+                market_type = next((mt for mt in MONEYLINE_MARKET_TYPES if mt in markets_raw), None)
+                market = markets_raw.get(market_type) if market_type is not None else None
                 if market is None or market.get("hidden") or not market.get("open"):
                     continue
 
@@ -230,7 +280,7 @@ class EasybetScraper(BaseScraper):
                         start_time=start_time,
                         bookmaker=self.bookmaker_id,
                         markets={
-                            MARKET_TYPE_MAP["winner3"]: MarketOdds(
+                            MARKET_TYPE_MAP[market_type]: MarketOdds(
                                 home_odds=home_odds, away_odds=away_odds, draw_odds=draw_odds
                             )
                         },
