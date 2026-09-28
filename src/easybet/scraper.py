@@ -33,17 +33,20 @@ Because `operatorUUID` is a fixed identifier for Easybet's organization
 hardcoded as EASYBET_ORG_UUID rather than rediscovered on every poll.
 
 Sports covered: soccer (`filter.sports=football`), rugby
-(`filter.sports=rugby`) and cricket (`filter.sports=cricket`) --
-South Africa's #1, #2 and #3 sports by popularity. The rugby and
-cricket values were both found the same way as `football`: a plain GET
-to the events endpoint with the candidate slug. `rugby` returned HTTP
-200 with real fixtures (`fixture.sport == "rugby"`, e.g. Top 14
-matches) on the first try; other plausible slugs (`rugby-union`,
-`rugby_union`, `rugbyunion`, `rugby-league`) all 400 with the API's own
-"invalid sport <value>" schema error, confirming `rugby` is the one
-real value. `cricket` also returned HTTP 200 directly on the first try
-(46 live fixtures, e.g. CSA T20 Challenge and various international
-ODI series), so no alternate slug needed to be tried.
+(`filter.sports=rugby`), cricket (`filter.sports=cricket`) and tennis
+(`filter.sports=tennis`) -- South Africa's #1-#3 sports by popularity
+plus tennis. The rugby, cricket and tennis values were all found the
+same way as `football`: a plain GET to the events endpoint with the
+candidate slug. `rugby` returned HTTP 200 with real fixtures
+(`fixture.sport == "rugby"`, e.g. Top 14 matches) on the first try;
+other plausible slugs (`rugby-union`, `rugby_union`, `rugbyunion`,
+`rugby-league`) all 400 with the API's own "invalid sport <value>"
+schema error, confirming `rugby` is the one real value. `cricket` also
+returned HTTP 200 directly on the first try (46 live fixtures, e.g.
+CSA T20 Challenge and various international ODI series), so no
+alternate slug needed to be tried. `tennis` likewise returned HTTP 200
+directly on the first try (a full 100-event page, e.g. ATP Beijing
+singles matches), no alternate slug needed either.
 
 Market shape differs by sport, though. Every rugby fixture inspected
 (30 live events, one full page) uses the exact same `winner3` three-way
@@ -70,6 +73,18 @@ carried a plain `winner3` market at all. Instead:
   skipped by to_odds_events (no known moneyline-shaped market found for
   them), the same code path already used for any event whose only
   markets aren't in MONEYLINE_MARKET_TYPES.
+
+Tennis needed yet another market-type key. A tennis match can't end in
+a draw (no overtime concept either -- it's played to a set/game
+conclusion), so a two-way market is expected, but it's neither of the
+two-way keys already mapped: every fixture on a full live page (100/100
+inspected, e.g. ATP Beijing singles) carries a market literally called
+`winner2` (`options` has only `home`/`away`, no `draw`) -- not
+`winner2-incl-overtime`, which cricket uses. No fixture in that page
+carried `winner2-incl-overtime` or `winner3` at all, so `winner2` is
+tennis's own distinct moneyline-equivalent key, mapped as a new
+MARKET_TYPE_MAP/MONEYLINE_MARKET_TYPES entry rather than reusing
+cricket's.
 """
 
 import asyncio
@@ -115,35 +130,41 @@ DEFAULT_POLL_INTERVAL_SECONDS = 45
 # Cricket does not use "winner3" at all (see the module docstring) --
 # limited-overs cricket's moneyline-equivalent is the two-way
 # "winner2-incl-overtime" market instead (no draw key in its options).
-# Both map to the same universal "moneyline" key; which one a given
-# fixture actually carries is resolved by MONEYLINE_MARKET_TYPES below.
+# Tennis uses yet another two-way key, plain "winner2" (no
+# "-incl-overtime" suffix -- tennis has no overtime concept). All three
+# map to the same universal "moneyline" key; which one a given fixture
+# actually carries is resolved by MONEYLINE_MARKET_TYPES below.
 MARKET_TYPE_MAP = {
     "winner3": "moneyline",
     "winner2-incl-overtime": "moneyline",
+    "winner2": "moneyline",
 }
 
 # The AdvBet market type keys that represent a "moneyline" market, in the
 # order to check for on a given fixture -- a fixture is expected to carry
 # at most one of these. "winner3" first since that's the three-way market
 # soccer/rugby (and, hypothetically, a future 3-way cricket format) use;
-# "winner2-incl-overtime" is cricket's own two-way equivalent. A fixture
-# with neither (e.g. multi-day/Test-length cricket, which instead carries
+# "winner2-incl-overtime" is cricket's own two-way equivalent; "winner2"
+# is tennis's own two-way equivalent (no "-incl-overtime" suffix -- see
+# the module docstring). A fixture with none of these (e.g.
+# multi-day/Test-length cricket, which instead carries
 # "winner-draw-no-bet" -- a different betting product, not a same-shape
 # market, see the module docstring) is skipped, same as any other event
 # missing a moneyline-shaped market.
-MONEYLINE_MARKET_TYPES: tuple[str, ...] = ("winner3", "winner2-incl-overtime")
+MONEYLINE_MARKET_TYPES: tuple[str, ...] = ("winner3", "winner2-incl-overtime", "winner2")
 
 # AdvBet's sport slug -> universal sport name used by the other bookmaker
 # adapters in this project (both Betway ZA and WSB report "soccer").
-# "rugby" and "cricket" are left as identity mappings (AdvBet's own slugs
-# already match the universal names we want) but spelled out explicitly
-# rather than relying on the fallback, in case AdvBet ever splits either
-# into more specific slugs (union/league/sevens for rugby, T20/ODI/Test
-# for cricket).
+# "rugby", "cricket" and "tennis" are left as identity mappings (AdvBet's
+# own slugs already match the universal names we want) but spelled out
+# explicitly rather than relying on the fallback, in case AdvBet ever
+# splits any of them into more specific slugs (union/league/sevens for
+# rugby, T20/ODI/Test for cricket, singles/doubles for tennis).
 SPORT_NAME_MAP = {
     "football": "soccer",
     "rugby": "rugby",
     "cricket": "cricket",
+    "tennis": "tennis",
 }
 
 # The sports this adapter polls every cycle. Each is fetched with its own
@@ -155,8 +176,9 @@ SPORT_NAME_MAP = {
 # a combined request's first page is almost entirely football and starves
 # the smaller sports out. Separate per-sport requests, each within its
 # own 100-event page, is what actually gets every sport's data -- cricket
-# (46 fixtures in its own full page) follows the same reasoning.
-EASYBET_SPORTS: tuple[str, ...] = ("football", "rugby", "cricket")
+# (46 fixtures in its own full page) and tennis (a full 100-event page on
+# its own) follow the same reasoning.
+EASYBET_SPORTS: tuple[str, ...] = ("football", "rugby", "cricket", "tennis")
 
 
 class EasybetScraper(BaseScraper):
@@ -186,11 +208,11 @@ class EasybetScraper(BaseScraper):
         OddsEvent schema. Moneyline market only for now -- resolved via
         MONEYLINE_MARKET_TYPES since the actual market type key differs by
         sport ("winner3" for soccer/rugby, "winner2-incl-overtime" for
-        limited-overs cricket; see the module docstring). Sport agnostic --
-        it reads each fixture's own `sport` field (via SPORT_NAME_MAP)
-        rather than trusting which `self.sports` entry the caller happened
-        to fetch, so it works the same for a football, rugby or cricket raw
-        payload.
+        limited-overs cricket, "winner2" for tennis; see the module
+        docstring). Sport agnostic -- it reads each fixture's own `sport`
+        field (via SPORT_NAME_MAP) rather than trusting which
+        `self.sports` entry the caller happened to fetch, so it works the
+        same for a football, rugby, cricket or tennis raw payload.
 
         The response's top-level `tournaments` array is a lookup table
         (by uuid, not filtered to only the events in this page) used to

@@ -254,6 +254,91 @@ CRICKET_TEST_MATCH_SAMPLE_RAW_PAYLOAD = {
 }
 
 
+# Shape captured from a real, plain GET to the same endpoint with
+# `filter.sports=tennis` (see scraper.py's module docstring -- `tennis`
+# returned HTTP 200 with real fixtures on the first try, no alternate
+# slug needed). Trimmed the same way as the other samples. Notably:
+# tennis does not use "winner3" or "winner2-incl-overtime" -- its
+# moneyline-equivalent market is a distinct two-way key, plain "winner2"
+# (options only has "home"/"away", no "draw" key), confirmed by
+# inspecting every fixture on a full live page (100/100 used "winner2").
+TENNIS_SAMPLE_RAW_PAYLOAD = {
+    "result": [
+        {
+            "fixture": {
+                "uuid": "000c3edc-5542-5403-92ad-2d947b6b5630",
+                "type": "match",
+                "categoryUuid": "49996bfe-c48a-5ddb-8510-9eab9037aaa5",
+                "tournamentUuid": "66ee285c-859e-5f27-80b8-0aebd1fbe094",
+                "state": "active",
+                "sport": "tennis",
+                "translations": {
+                    "en": [
+                        {"type": "season", "value": "ATP Beijing, China Men Singles 2026"},
+                        {"type": "team", "values": {"away": "Navone, Mariano", "home": "de Minaur, Alex"}},
+                    ]
+                },
+                "metadata": {"startedAt": "2026-09-30T02:00:00Z"},
+                "closesAt": "2026-09-30T02:00:00Z",
+            },
+            "betting": {
+                "hidden": False,
+                "suspended": False,
+                "markets": {
+                    "winner2": {
+                        "type": "winner2",
+                        "hidden": False,
+                        "open": True,
+                        "options": {
+                            "away": {"key": "away", "state": "active", "odds": 4.4},
+                            "home": {"key": "home", "state": "active", "odds": 1.13},
+                        },
+                    },
+                },
+            },
+        }
+    ],
+    "count": 1,
+    "categories": [],
+    "tournaments": [
+        {
+            "uuid": "66ee285c-859e-5f27-80b8-0aebd1fbe094",
+            "categoryUuid": "49996bfe-c48a-5ddb-8510-9eab9037aaa5",
+            "slug": "atp-beijing-china-men-singles",
+            "translations": {"en": "ATP Beijing, China Men Singles", "lt": "ATP Pekinas"},
+            "countryCode": "CN",
+            "sport": "tennis",
+        }
+    ],
+}
+
+
+def test_to_odds_events_maps_tennis_fixture_and_winner2_market():
+    """Tennis does not use winner3 or winner2-incl-overtime -- its
+    moneyline-equivalent market is the distinct two-way "winner2" key
+    (see MONEYLINE_MARKET_TYPES and the module docstring). Its options
+    never carry a "draw" key (tennis can't end in a draw), so draw_odds
+    should come out None here rather than 0 or missing -- the existing
+    option-parsing loop already handles that gracefully with no
+    tennis-specific code."""
+    scraper = EasybetScraper()
+
+    events = scraper.to_odds_events(TENNIS_SAMPLE_RAW_PAYLOAD)
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.sport == "tennis"
+    assert event.league == "ATP Beijing, China Men Singles"
+    assert event.home_team == "de Minaur, Alex"
+    assert event.away_team == "Navone, Mariano"
+    assert event.bookmaker == "easybet"
+    assert event.event_id is None
+    assert event.markets["moneyline"].home_odds == 1.13
+    assert event.markets["moneyline"].away_odds == 4.4
+    assert event.markets["moneyline"].draw_odds is None
+    assert list(event.markets.keys()) == ["moneyline"]
+
+
 def test_to_odds_events_maps_rugby_fixture_and_winner3_market():
     """Rugby goes through the exact same winner3 mapping path as soccer --
     it uses the same three-way market, just a much longer-shot draw
@@ -333,8 +418,8 @@ def test_to_odds_events_skips_multi_day_cricket_with_only_winner_draw_no_bet_mar
     assert scraper.to_odds_events(CRICKET_TEST_MATCH_SAMPLE_RAW_PAYLOAD) == []
 
 
-def test_to_odds_events_handles_all_three_sports_in_the_same_batch_independently():
-    """A single poll cycle combines all three sports' raw payloads (see
+def test_to_odds_events_handles_all_four_sports_in_the_same_batch_independently():
+    """A single poll cycle combines all four sports' raw payloads (see
     poll()) before to_odds_events ever sees them combined -- confirming
     the per-fixture sport and market-type lookups don't leak state
     between events of different sports (and different moneyline market
@@ -344,23 +429,27 @@ def test_to_odds_events_handles_all_three_sports_in_the_same_batch_independently
             SAMPLE_RAW_PAYLOAD["result"][0],
             RUGBY_SAMPLE_RAW_PAYLOAD["result"][0],
             CRICKET_SAMPLE_RAW_PAYLOAD["result"][0],
+            TENNIS_SAMPLE_RAW_PAYLOAD["result"][0],
         ],
         "tournaments": [
             *SAMPLE_RAW_PAYLOAD["tournaments"],
             *RUGBY_SAMPLE_RAW_PAYLOAD["tournaments"],
             *CRICKET_SAMPLE_RAW_PAYLOAD["tournaments"],
+            *TENNIS_SAMPLE_RAW_PAYLOAD["tournaments"],
         ],
     }
     scraper = EasybetScraper()
 
     events = scraper.to_odds_events(payload)
 
-    assert len(events) == 3
+    assert len(events) == 4
     by_sport = {e.sport: e for e in events}
     assert by_sport["soccer"].home_team == "AFC Metalul Buzau"
     assert by_sport["rugby"].home_team == "Aviron Bayonne"
     assert by_sport["cricket"].home_team == "Boland"
     assert by_sport["cricket"].markets["moneyline"].draw_odds is None
+    assert by_sport["tennis"].home_team == "de Minaur, Alex"
+    assert by_sport["tennis"].markets["moneyline"].draw_odds is None
 
 
 def test_to_odds_events_maps_fixture_and_winner3_market():
@@ -544,15 +633,16 @@ def test_to_odds_events_skips_a_malformed_event_without_crashing_the_batch():
 
 @pytest.mark.asyncio
 async def test_poll_yields_events_on_a_fixed_interval(monkeypatch):
-    """poll() now fetches every sport in scraper.sports (football, rugby
-    and cricket by default) each cycle and yields one combined list -- the
-    fake below returns each sport's own sample payload, so a full cycle's
-    batch has one event per sport."""
+    """poll() now fetches every sport in scraper.sports (football, rugby,
+    cricket and tennis by default) each cycle and yields one combined
+    list -- the fake below returns each sport's own sample payload, so a
+    full cycle's batch has one event per sport."""
     scraper = EasybetScraper()
     payloads = {
         "football": SAMPLE_RAW_PAYLOAD,
         "rugby": RUGBY_SAMPLE_RAW_PAYLOAD,
         "cricket": CRICKET_SAMPLE_RAW_PAYLOAD,
+        "tennis": TENNIS_SAMPLE_RAW_PAYLOAD,
     }
 
     async def fake_fetch_raw_odds(sport):
@@ -568,8 +658,13 @@ async def test_poll_yields_events_on_a_fixed_interval(monkeypatch):
 
     assert len(results) == 3
     for batch in results:
-        assert len(batch) == 3
-        assert {e.home_team for e in batch} == {"AFC Metalul Buzau", "Aviron Bayonne", "Boland"}
+        assert len(batch) == 4
+        assert {e.home_team for e in batch} == {
+            "AFC Metalul Buzau",
+            "Aviron Bayonne",
+            "Boland",
+            "de Minaur, Alex",
+        }
 
 
 @pytest.mark.asyncio
@@ -581,7 +676,11 @@ async def test_poll_continues_past_a_transient_fetch_failure_for_one_sport(monke
     import httpx
 
     scraper = EasybetScraper()
-    payloads = {"rugby": RUGBY_SAMPLE_RAW_PAYLOAD, "cricket": CRICKET_SAMPLE_RAW_PAYLOAD}
+    payloads = {
+        "rugby": RUGBY_SAMPLE_RAW_PAYLOAD,
+        "cricket": CRICKET_SAMPLE_RAW_PAYLOAD,
+        "tennis": TENNIS_SAMPLE_RAW_PAYLOAD,
+    }
 
     async def flaky_fetch_raw_odds(sport):
         if sport == "football":
@@ -596,8 +695,8 @@ async def test_poll_continues_past_a_transient_fetch_failure_for_one_sport(monke
         break
 
     assert len(results) == 1
-    assert len(results[0]) == 2
-    assert {e.home_team for e in results[0]} == {"Aviron Bayonne", "Boland"}
+    assert len(results[0]) == 3
+    assert {e.home_team for e in results[0]} == {"Aviron Bayonne", "Boland", "de Minaur, Alex"}
 
 
 @pytest.mark.asyncio
@@ -643,6 +742,7 @@ async def test_poll_recovers_after_a_fully_failed_cycle(monkeypatch):
         "football": SAMPLE_RAW_PAYLOAD,
         "rugby": RUGBY_SAMPLE_RAW_PAYLOAD,
         "cricket": CRICKET_SAMPLE_RAW_PAYLOAD,
+        "tennis": TENNIS_SAMPLE_RAW_PAYLOAD,
     }
     cycle = 0
 
@@ -662,4 +762,4 @@ async def test_poll_recovers_after_a_fully_failed_cycle(monkeypatch):
         break
 
     assert len(results) == 1
-    assert len(results[0]) == 3
+    assert len(results[0]) == 4
