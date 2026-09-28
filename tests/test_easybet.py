@@ -313,6 +313,111 @@ TENNIS_SAMPLE_RAW_PAYLOAD = {
 }
 
 
+# Shape captured from a real, plain GET to the same endpoint with
+# `filter.sports=basketball` (see scraper.py's module docstring --
+# `basketball` returned HTTP 200 with real fixtures on the first try, no
+# alternate slug needed). Trimmed the same way as the other samples.
+# Notably: unlike every other sport so far, this fixture carries BOTH
+# "winner3" (a real, actively priced three-way "regulation time result"
+# market -- draw odds of 12.0 here -- a distinct betting product, not
+# basketball's actual match winner) AND "winner2-incl-overtime" (the
+# genuine two-way moneyline market, since a basketball game always
+# resolves to a winner via overtime). Confirmed by inspecting every
+# fixture on a full live page (100/100 carried both keys together).
+# MONEYLINE_MARKET_TYPES is ordered so "winner2-incl-overtime" is
+# preferred over "winner3" for exactly this reason -- see the module
+# docstring. This fixture is deliberately kept with both markets present
+# (rather than trimming "winner3" out like other unrelated market types)
+# so the tests below exercise that ordering choice against real shape,
+# not a synthetic one.
+BASKETBALL_SAMPLE_RAW_PAYLOAD = {
+    "result": [
+        {
+            "fixture": {
+                "uuid": "01eaed50-0055-5693-b77b-eedb4b1006f0",
+                "type": "match",
+                "categoryUuid": "b9a75973-2191-5dbe-bd92-937b2b1d0131",
+                "tournamentUuid": "5e7b1c59-b656-595a-8578-2b50bf63bbf7",
+                "state": "active",
+                "sport": "basketball",
+                "translations": {
+                    "en": [
+                        {"type": "season", "value": "NBL 26/27"},
+                        {"type": "team", "values": {"away": "Cairns Taipans", "home": "New Zealand Breakers"}},
+                    ]
+                },
+                "metadata": {"startedAt": "2026-09-30T07:30:00Z"},
+                "closesAt": "2026-09-30T07:30:00Z",
+            },
+            "betting": {
+                "hidden": False,
+                "suspended": False,
+                "markets": {
+                    "winner3": {
+                        "type": "winner3",
+                        "hidden": False,
+                        "open": True,
+                        "options": {
+                            "away": {"key": "away", "state": "active", "odds": 2.31},
+                            "draw": {"key": "draw", "state": "active", "odds": 12},
+                            "home": {"key": "home", "state": "active", "odds": 1.6},
+                        },
+                    },
+                    "winner2-incl-overtime": {
+                        "type": "winner2-incl-overtime",
+                        "hidden": False,
+                        "open": True,
+                        "options": {
+                            "away": {"key": "away", "state": "active", "odds": 2.17},
+                            "home": {"key": "home", "state": "active", "odds": 1.52},
+                        },
+                    },
+                },
+            },
+        }
+    ],
+    "count": 1,
+    "categories": [],
+    "tournaments": [
+        {
+            "uuid": "5e7b1c59-b656-595a-8578-2b50bf63bbf7",
+            "categoryUuid": "b9a75973-2191-5dbe-bd92-937b2b1d0131",
+            "slug": "nbl",
+            "translations": {"en": "NBL", "lt": "NBL", "ru": "НБЛ"},
+            "countryCode": "AU",
+            "sport": "basketball",
+        }
+    ],
+}
+
+
+def test_to_odds_events_maps_basketball_fixture_and_prefers_winner2_incl_overtime_over_winner3():
+    """Basketball fixtures carry both "winner3" (a real but distinct
+    regulation-time-result market with an actively priced draw) and
+    "winner2-incl-overtime" (the true match-winner two-way market) at
+    once -- the only sport so far where that happens (see the module
+    docstring). This confirms the mapping picks the correct one: home/
+    away odds from "winner2-incl-overtime" (1.52/2.17), not "winner3"
+    (1.6/2.31/12), and no draw_odds leaks through even though a draw
+    price does exist in the raw payload."""
+    scraper = EasybetScraper()
+
+    events = scraper.to_odds_events(BASKETBALL_SAMPLE_RAW_PAYLOAD)
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.sport == "basketball"
+    assert event.league == "NBL"
+    assert event.home_team == "New Zealand Breakers"
+    assert event.away_team == "Cairns Taipans"
+    assert event.bookmaker == "easybet"
+    assert event.event_id is None
+    assert event.markets["moneyline"].home_odds == 1.52
+    assert event.markets["moneyline"].away_odds == 2.17
+    assert event.markets["moneyline"].draw_odds is None
+    assert list(event.markets.keys()) == ["moneyline"]
+
+
 def test_to_odds_events_maps_tennis_fixture_and_winner2_market():
     """Tennis does not use winner3 or winner2-incl-overtime -- its
     moneyline-equivalent market is the distinct two-way "winner2" key
@@ -418,31 +523,36 @@ def test_to_odds_events_skips_multi_day_cricket_with_only_winner_draw_no_bet_mar
     assert scraper.to_odds_events(CRICKET_TEST_MATCH_SAMPLE_RAW_PAYLOAD) == []
 
 
-def test_to_odds_events_handles_all_four_sports_in_the_same_batch_independently():
-    """A single poll cycle combines all four sports' raw payloads (see
+def test_to_odds_events_handles_all_five_sports_in_the_same_batch_independently():
+    """A single poll cycle combines all five sports' raw payloads (see
     poll()) before to_odds_events ever sees them combined -- confirming
     the per-fixture sport and market-type lookups don't leak state
     between events of different sports (and different moneyline market
-    keys) in one batch."""
+    keys) in one batch. Includes basketball's fixture, which uniquely
+    carries both "winner3" and "winner2-incl-overtime" at once, to
+    confirm that doesn't confuse the other sports' single-market
+    fixtures in the same batch."""
     payload = {
         "result": [
             SAMPLE_RAW_PAYLOAD["result"][0],
             RUGBY_SAMPLE_RAW_PAYLOAD["result"][0],
             CRICKET_SAMPLE_RAW_PAYLOAD["result"][0],
             TENNIS_SAMPLE_RAW_PAYLOAD["result"][0],
+            BASKETBALL_SAMPLE_RAW_PAYLOAD["result"][0],
         ],
         "tournaments": [
             *SAMPLE_RAW_PAYLOAD["tournaments"],
             *RUGBY_SAMPLE_RAW_PAYLOAD["tournaments"],
             *CRICKET_SAMPLE_RAW_PAYLOAD["tournaments"],
             *TENNIS_SAMPLE_RAW_PAYLOAD["tournaments"],
+            *BASKETBALL_SAMPLE_RAW_PAYLOAD["tournaments"],
         ],
     }
     scraper = EasybetScraper()
 
     events = scraper.to_odds_events(payload)
 
-    assert len(events) == 4
+    assert len(events) == 5
     by_sport = {e.sport: e for e in events}
     assert by_sport["soccer"].home_team == "AFC Metalul Buzau"
     assert by_sport["rugby"].home_team == "Aviron Bayonne"
@@ -450,6 +560,9 @@ def test_to_odds_events_handles_all_four_sports_in_the_same_batch_independently(
     assert by_sport["cricket"].markets["moneyline"].draw_odds is None
     assert by_sport["tennis"].home_team == "de Minaur, Alex"
     assert by_sport["tennis"].markets["moneyline"].draw_odds is None
+    assert by_sport["basketball"].home_team == "New Zealand Breakers"
+    assert by_sport["basketball"].markets["moneyline"].home_odds == 1.52
+    assert by_sport["basketball"].markets["moneyline"].draw_odds is None
 
 
 def test_to_odds_events_maps_fixture_and_winner3_market():
@@ -634,15 +747,16 @@ def test_to_odds_events_skips_a_malformed_event_without_crashing_the_batch():
 @pytest.mark.asyncio
 async def test_poll_yields_events_on_a_fixed_interval(monkeypatch):
     """poll() now fetches every sport in scraper.sports (football, rugby,
-    cricket and tennis by default) each cycle and yields one combined
-    list -- the fake below returns each sport's own sample payload, so a
-    full cycle's batch has one event per sport."""
+    cricket, tennis and basketball by default) each cycle and yields one
+    combined list -- the fake below returns each sport's own sample
+    payload, so a full cycle's batch has one event per sport."""
     scraper = EasybetScraper()
     payloads = {
         "football": SAMPLE_RAW_PAYLOAD,
         "rugby": RUGBY_SAMPLE_RAW_PAYLOAD,
         "cricket": CRICKET_SAMPLE_RAW_PAYLOAD,
         "tennis": TENNIS_SAMPLE_RAW_PAYLOAD,
+        "basketball": BASKETBALL_SAMPLE_RAW_PAYLOAD,
     }
 
     async def fake_fetch_raw_odds(sport):
@@ -658,12 +772,13 @@ async def test_poll_yields_events_on_a_fixed_interval(monkeypatch):
 
     assert len(results) == 3
     for batch in results:
-        assert len(batch) == 4
+        assert len(batch) == 5
         assert {e.home_team for e in batch} == {
             "AFC Metalul Buzau",
             "Aviron Bayonne",
             "Boland",
             "de Minaur, Alex",
+            "New Zealand Breakers",
         }
 
 
@@ -680,6 +795,7 @@ async def test_poll_continues_past_a_transient_fetch_failure_for_one_sport(monke
         "rugby": RUGBY_SAMPLE_RAW_PAYLOAD,
         "cricket": CRICKET_SAMPLE_RAW_PAYLOAD,
         "tennis": TENNIS_SAMPLE_RAW_PAYLOAD,
+        "basketball": BASKETBALL_SAMPLE_RAW_PAYLOAD,
     }
 
     async def flaky_fetch_raw_odds(sport):
@@ -695,8 +811,13 @@ async def test_poll_continues_past_a_transient_fetch_failure_for_one_sport(monke
         break
 
     assert len(results) == 1
-    assert len(results[0]) == 3
-    assert {e.home_team for e in results[0]} == {"Aviron Bayonne", "Boland", "de Minaur, Alex"}
+    assert len(results[0]) == 4
+    assert {e.home_team for e in results[0]} == {
+        "Aviron Bayonne",
+        "Boland",
+        "de Minaur, Alex",
+        "New Zealand Breakers",
+    }
 
 
 @pytest.mark.asyncio
@@ -743,6 +864,7 @@ async def test_poll_recovers_after_a_fully_failed_cycle(monkeypatch):
         "rugby": RUGBY_SAMPLE_RAW_PAYLOAD,
         "cricket": CRICKET_SAMPLE_RAW_PAYLOAD,
         "tennis": TENNIS_SAMPLE_RAW_PAYLOAD,
+        "basketball": BASKETBALL_SAMPLE_RAW_PAYLOAD,
     }
     cycle = 0
 
@@ -762,4 +884,4 @@ async def test_poll_recovers_after_a_fully_failed_cycle(monkeypatch):
         break
 
     assert len(results) == 1
-    assert len(results[0]) == 4
+    assert len(results[0]) == 5

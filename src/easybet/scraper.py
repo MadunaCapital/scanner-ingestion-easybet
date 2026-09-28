@@ -33,9 +33,10 @@ Because `operatorUUID` is a fixed identifier for Easybet's organization
 hardcoded as EASYBET_ORG_UUID rather than rediscovered on every poll.
 
 Sports covered: soccer (`filter.sports=football`), rugby
-(`filter.sports=rugby`), cricket (`filter.sports=cricket`) and tennis
-(`filter.sports=tennis`) -- South Africa's #1-#3 sports by popularity
-plus tennis. The rugby, cricket and tennis values were all found the
+(`filter.sports=rugby`), cricket (`filter.sports=cricket`), tennis
+(`filter.sports=tennis`) and basketball (`filter.sports=basketball`) --
+South Africa's #1-#3 sports by popularity plus tennis and basketball.
+The rugby, cricket, tennis and basketball values were all found the
 same way as `football`: a plain GET to the events endpoint with the
 candidate slug. `rugby` returned HTTP 200 with real fixtures
 (`fixture.sport == "rugby"`, e.g. Top 14 matches) on the first try;
@@ -46,7 +47,10 @@ returned HTTP 200 directly on the first try (46 live fixtures, e.g.
 CSA T20 Challenge and various international ODI series), so no
 alternate slug needed to be tried. `tennis` likewise returned HTTP 200
 directly on the first try (a full 100-event page, e.g. ATP Beijing
-singles matches), no alternate slug needed either.
+singles matches), no alternate slug needed either. `basketball`
+likewise returned HTTP 200 directly on the first try (a full 100-event
+page, e.g. NBL matches like New Zealand Breakers vs Cairns Taipans), no
+alternate slug needed either.
 
 Market shape differs by sport, though. Every rugby fixture inspected
 (30 live events, one full page) uses the exact same `winner3` three-way
@@ -85,6 +89,33 @@ carried `winner2-incl-overtime` or `winner3` at all, so `winner2` is
 tennis's own distinct moneyline-equivalent key, mapped as a new
 MARKET_TYPE_MAP/MONEYLINE_MARKET_TYPES entry rather than reusing
 cricket's.
+
+Basketball needed no new key -- but it surfaced a real ordering trap
+that no earlier sport did. A basketball game always resolves to a
+winner (tied after regulation goes to overtime), so the expected
+moneyline-equivalent is a genuine two-way market. Every fixture on a
+full live page (100/100 inspected, e.g. NBL's New Zealand Breakers vs
+Cairns Taipans) does carry `winner2-incl-overtime` (`options` has only
+`home`/`away`, no `draw`) -- the same key cricket uses, reused as-is
+rather than adding a new MARKET_TYPE_MAP entry. The trap: every one of
+those same 100 fixtures *also* carries `winner3`, with a real, actively
+priced `draw` option (e.g. odds of 12.0 alongside 1.6/2.31 favourite/
+underdog prices) -- this is a distinct "regulation time result" betting
+product (the score at the end of regulation, before overtime, can
+genuinely tie) rather than the same three-way shape soccer/rugby use
+for their actual final result. Since MONEYLINE_MARKET_TYPES previously
+listed `winner3` before `winner2-incl-overtime`, leaving the order
+unchanged would have silently picked basketball's regulation-time
+`winner3` market (complete with a real but wrong "draw" price) over its
+true match-winner `winner2-incl-overtime` market. The tuple's order was
+changed to check `winner2-incl-overtime` before `winner3` to fix this.
+This is safe for every other sport: soccer and rugby fixtures only ever
+carry `winner3` (never `winner2-incl-overtime`), and limited-overs
+cricket fixtures only ever carry `winner2-incl-overtime` (never
+`winner3`, per the docstring above) -- so for those sports only one of
+the two keys is ever present and the order between them never mattered.
+Basketball is the first sport in this adapter where a single fixture
+carries more than one MONEYLINE_MARKET_TYPES candidate at once.
 """
 
 import asyncio
@@ -131,9 +162,12 @@ DEFAULT_POLL_INTERVAL_SECONDS = 45
 # limited-overs cricket's moneyline-equivalent is the two-way
 # "winner2-incl-overtime" market instead (no draw key in its options).
 # Tennis uses yet another two-way key, plain "winner2" (no
-# "-incl-overtime" suffix -- tennis has no overtime concept). All three
-# map to the same universal "moneyline" key; which one a given fixture
-# actually carries is resolved by MONEYLINE_MARKET_TYPES below.
+# "-incl-overtime" suffix -- tennis has no overtime concept). Basketball
+# reuses cricket's "winner2-incl-overtime" key rather than needing a
+# fourth (see the module docstring for why -- it always resolves to a
+# winner via overtime). All map to the same universal "moneyline" key;
+# which one a given fixture actually carries is resolved by
+# MONEYLINE_MARKET_TYPES below.
 MARKET_TYPE_MAP = {
     "winner3": "moneyline",
     "winner2-incl-overtime": "moneyline",
@@ -142,29 +176,38 @@ MARKET_TYPE_MAP = {
 
 # The AdvBet market type keys that represent a "moneyline" market, in the
 # order to check for on a given fixture -- a fixture is expected to carry
-# at most one of these. "winner3" first since that's the three-way market
-# soccer/rugby (and, hypothetically, a future 3-way cricket format) use;
-# "winner2-incl-overtime" is cricket's own two-way equivalent; "winner2"
-# is tennis's own two-way equivalent (no "-incl-overtime" suffix -- see
-# the module docstring). A fixture with none of these (e.g.
-# multi-day/Test-length cricket, which instead carries
-# "winner-draw-no-bet" -- a different betting product, not a same-shape
-# market, see the module docstring) is skipped, same as any other event
-# missing a moneyline-shaped market.
-MONEYLINE_MARKET_TYPES: tuple[str, ...] = ("winner3", "winner2-incl-overtime", "winner2")
+# at most one of these, EXCEPT basketball, which carries both "winner3"
+# and "winner2-incl-overtime" at once (see the module docstring), which is
+# why "winner2-incl-overtime" is listed before "winner3" here: basketball
+# always resolves to a winner, so its true moneyline market is the
+# two-way "winner2-incl-overtime" one, not "winner3" (a distinct
+# regulation-time-result product for basketball, complete with its own
+# real "draw" price). This ordering is safe for soccer/rugby (only ever
+# carry "winner3") and limited-overs cricket (only ever carries
+# "winner2-incl-overtime") since each of those only ever has one of the
+# two keys present. "winner2" is tennis's own two-way equivalent (no
+# "-incl-overtime" suffix -- see the module docstring). A fixture with
+# none of these (e.g. multi-day/Test-length cricket, which instead
+# carries "winner-draw-no-bet" -- a different betting product, not a
+# same-shape market, see the module docstring) is skipped, same as any
+# other event missing a moneyline-shaped market.
+MONEYLINE_MARKET_TYPES: tuple[str, ...] = ("winner2-incl-overtime", "winner3", "winner2")
 
 # AdvBet's sport slug -> universal sport name used by the other bookmaker
 # adapters in this project (both Betway ZA and WSB report "soccer").
-# "rugby", "cricket" and "tennis" are left as identity mappings (AdvBet's
-# own slugs already match the universal names we want) but spelled out
-# explicitly rather than relying on the fallback, in case AdvBet ever
-# splits any of them into more specific slugs (union/league/sevens for
-# rugby, T20/ODI/Test for cricket, singles/doubles for tennis).
+# "rugby", "cricket", "tennis" and "basketball" are left as identity
+# mappings (AdvBet's own slugs already match the universal names we
+# want) but spelled out explicitly rather than relying on the fallback,
+# in case AdvBet ever splits any of them into more specific slugs
+# (union/league/sevens for rugby, T20/ODI/Test for cricket,
+# singles/doubles for tennis, NBA/NBL/euroleague-style splits for
+# basketball).
 SPORT_NAME_MAP = {
     "football": "soccer",
     "rugby": "rugby",
     "cricket": "cricket",
     "tennis": "tennis",
+    "basketball": "basketball",
 }
 
 # The sports this adapter polls every cycle. Each is fetched with its own
@@ -176,9 +219,10 @@ SPORT_NAME_MAP = {
 # a combined request's first page is almost entirely football and starves
 # the smaller sports out. Separate per-sport requests, each within its
 # own 100-event page, is what actually gets every sport's data -- cricket
-# (46 fixtures in its own full page) and tennis (a full 100-event page on
-# its own) follow the same reasoning.
-EASYBET_SPORTS: tuple[str, ...] = ("football", "rugby", "cricket", "tennis")
+# (46 fixtures in its own full page), tennis (a full 100-event page on
+# its own) and basketball (also a full 100-event page on its own) follow
+# the same reasoning.
+EASYBET_SPORTS: tuple[str, ...] = ("football", "rugby", "cricket", "tennis", "basketball")
 
 
 class EasybetScraper(BaseScraper):
@@ -208,11 +252,13 @@ class EasybetScraper(BaseScraper):
         OddsEvent schema. Moneyline market only for now -- resolved via
         MONEYLINE_MARKET_TYPES since the actual market type key differs by
         sport ("winner3" for soccer/rugby, "winner2-incl-overtime" for
-        limited-overs cricket, "winner2" for tennis; see the module
-        docstring). Sport agnostic -- it reads each fixture's own `sport`
-        field (via SPORT_NAME_MAP) rather than trusting which
-        `self.sports` entry the caller happened to fetch, so it works the
-        same for a football, rugby, cricket or tennis raw payload.
+        limited-overs cricket and basketball, "winner2" for tennis; see
+        the module docstring for why basketball reuses cricket's key and
+        why the tuple order matters for it). Sport agnostic -- it reads
+        each fixture's own `sport` field (via SPORT_NAME_MAP) rather than
+        trusting which `self.sports` entry the caller happened to fetch,
+        so it works the same for a football, rugby, cricket, tennis or
+        basketball raw payload.
 
         The response's top-level `tournaments` array is a lookup table
         (by uuid, not filtered to only the events in this page) used to
