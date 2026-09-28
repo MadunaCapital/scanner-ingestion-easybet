@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from easybet import EasybetScraper
@@ -65,6 +67,110 @@ SAMPLE_RAW_PAYLOAD = {
         }
     ],
 }
+
+
+# Shape captured from a real, plain GET to the same endpoint with
+# `filter.sports=rugby` (see scraper.py's module docstring for how that
+# value was confirmed -- every other plausible slug 400s). Trimmed the
+# same way as SAMPLE_RAW_PAYLOAD (dropped the player/competitor
+# translation lists and every other market type), field names and values
+# otherwise unchanged from the real response. Notably: rugby uses the
+# exact same "winner3" three-way market as soccer (a rugby union match
+# can end in a draw), not a separate two-way market -- confirmed by
+# inspecting every fixture on a full live page (30/30 used "winner3").
+RUGBY_SAMPLE_RAW_PAYLOAD = {
+    "result": [
+        {
+            "fixture": {
+                "uuid": "0d0891d0-23e0-507a-bb4b-92c3face022e",
+                "type": "match",
+                "categoryUuid": "ca88e612-92b1-5337-b367-723487eddcae",
+                "tournamentUuid": "47b9a1e8-1eb5-531c-8042-b113f2eb319a",
+                "state": "active",
+                "sport": "rugby",
+                "translations": {
+                    "en": [
+                        {"type": "season", "value": "Top 14 26/27"},
+                        {"type": "team", "values": {"away": "Stade Francais Paris", "home": "Aviron Bayonne"}},
+                    ]
+                },
+                "metadata": {"startedAt": "2026-10-03T14:35:00Z"},
+                "closesAt": "2026-10-03T14:35:00Z",
+            },
+            "betting": {
+                "hidden": False,
+                "suspended": False,
+                "markets": {
+                    "winner3": {
+                        "type": "winner3",
+                        "hidden": False,
+                        "open": True,
+                        "options": {
+                            "away": {"key": "away", "state": "active", "odds": 3.45},
+                            "draw": {"key": "draw", "state": "active", "odds": 22},
+                            "home": {"key": "home", "state": "active", "odds": 1.32},
+                        },
+                    },
+                },
+            },
+        }
+    ],
+    "count": 1,
+    "categories": [],
+    "tournaments": [
+        {
+            "uuid": "47b9a1e8-1eb5-531c-8042-b113f2eb319a",
+            "categoryUuid": "ca88e612-92b1-5337-b367-723487eddcae",
+            "slug": "top-14",
+            "translations": {"en": "Top 14", "lt": "Top 14", "ru": "Топ 14"},
+            "countryCode": "FR",
+            "sport": "rugby",
+        }
+    ],
+}
+
+
+def test_to_odds_events_maps_rugby_fixture_and_winner3_market():
+    """Rugby goes through the exact same winner3 mapping path as soccer --
+    it uses the same three-way market, just a much longer-shot draw
+    price -- so this only needs to confirm the sport-name passthrough and
+    that the mapping isn't accidentally soccer-specific."""
+    scraper = EasybetScraper()
+
+    events = scraper.to_odds_events(RUGBY_SAMPLE_RAW_PAYLOAD)
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.sport == "rugby"
+    assert event.league == "Top 14"
+    assert event.home_team == "Aviron Bayonne"
+    assert event.away_team == "Stade Francais Paris"
+    assert event.bookmaker == "easybet"
+    assert event.event_id is None
+    assert event.markets["moneyline"].home_odds == 1.32
+    assert event.markets["moneyline"].away_odds == 3.45
+    assert event.markets["moneyline"].draw_odds == 22
+    assert list(event.markets.keys()) == ["moneyline"]
+
+
+def test_to_odds_events_handles_soccer_and_rugby_in_the_same_batch_independently():
+    """A single poll cycle now combines both sports' raw payloads (see
+    poll()) before to_odds_events ever sees them combined -- but
+    to_odds_events itself is also exercised directly here with a payload
+    holding one of each, confirming the per-fixture sport lookup doesn't
+    leak state between events of different sports in one batch."""
+    payload = {
+        "result": [SAMPLE_RAW_PAYLOAD["result"][0], RUGBY_SAMPLE_RAW_PAYLOAD["result"][0]],
+        "tournaments": [*SAMPLE_RAW_PAYLOAD["tournaments"], *RUGBY_SAMPLE_RAW_PAYLOAD["tournaments"]],
+    }
+    scraper = EasybetScraper()
+
+    events = scraper.to_odds_events(payload)
+
+    assert len(events) == 2
+    by_sport = {e.sport: e for e in events}
+    assert by_sport["soccer"].home_team == "AFC Metalul Buzau"
+    assert by_sport["rugby"].home_team == "Aviron Bayonne"
 
 
 def test_to_odds_events_maps_fixture_and_winner3_market():
@@ -248,10 +354,15 @@ def test_to_odds_events_skips_a_malformed_event_without_crashing_the_batch():
 
 @pytest.mark.asyncio
 async def test_poll_yields_events_on_a_fixed_interval(monkeypatch):
+    """poll() now fetches every sport in scraper.sports (football and
+    rugby by default) each cycle and yields one combined list -- the fake
+    below returns each sport's own sample payload, so a full cycle's batch
+    has one event per sport."""
     scraper = EasybetScraper()
+    payloads = {"football": SAMPLE_RAW_PAYLOAD, "rugby": RUGBY_SAMPLE_RAW_PAYLOAD}
 
-    async def fake_fetch_raw_odds():
-        return SAMPLE_RAW_PAYLOAD
+    async def fake_fetch_raw_odds(sport):
+        return payloads[sport]
 
     monkeypatch.setattr(scraper, "fetch_raw_odds", fake_fetch_raw_odds)
 
@@ -262,30 +373,90 @@ async def test_poll_yields_events_on_a_fixed_interval(monkeypatch):
             break
 
     assert len(results) == 3
-    assert all(len(batch) == 1 and batch[0].home_team == "AFC Metalul Buzau" for batch in results)
+    for batch in results:
+        assert len(batch) == 2
+        assert {e.home_team for e in batch} == {"AFC Metalul Buzau", "Aviron Bayonne"}
 
 
 @pytest.mark.asyncio
-async def test_poll_continues_past_a_transient_fetch_failure(monkeypatch):
+async def test_poll_continues_past_a_transient_fetch_failure_for_one_sport(monkeypatch):
+    """If only one sport's fetch fails this cycle (e.g. a momentary 5xx),
+    the other sport's odds still get yielded rather than withholding the
+    whole cycle -- same per-record defensiveness to_odds_events already
+    applies to a single malformed event, applied here per-sport."""
     import httpx
 
     scraper = EasybetScraper()
-    call_count = 0
 
-    async def flaky_fetch_raw_odds():
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
+    async def flaky_fetch_raw_odds(sport):
+        if sport == "football":
             raise httpx.ConnectError("simulated network blip")
-        return SAMPLE_RAW_PAYLOAD
+        return RUGBY_SAMPLE_RAW_PAYLOAD
 
     monkeypatch.setattr(scraper, "fetch_raw_odds", flaky_fetch_raw_odds)
 
     results = []
     async for events in scraper.poll(interval_seconds=0.01):
         results.append(events)
-        break  # first successful yield should be the second call, after the failure
+        break
 
-    assert call_count == 2
     assert len(results) == 1
-    assert results[0][0].home_team == "AFC Metalul Buzau"
+    assert len(results[0]) == 1
+    assert results[0][0].home_team == "Aviron Bayonne"
+
+
+@pytest.mark.asyncio
+async def test_poll_yields_nothing_when_every_sport_fetch_fails(monkeypatch):
+    """A total outage (every sport's fetch fails) stays silent for the
+    cycle -- exactly like the pre-rugby single-sport version did -- so the
+    caller's heartbeat write is skipped too and a real outage still shows
+    up as an expired heartbeat key downstream rather than a healthy
+    "0 events" cycle. Since poll() never yields in this scenario, an
+    ordinary `async for` would hang forever (bounded only by pytest's
+    global timeout) -- pull from the generator directly under a short
+    asyncio.wait_for instead, so a correct implementation (no yield) is
+    what makes this test pass quickly, not what makes it hang.
+    """
+    import httpx
+
+    scraper = EasybetScraper()
+    call_count = 0
+
+    async def always_failing_fetch_raw_odds(sport):
+        nonlocal call_count
+        call_count += 1
+        raise httpx.ConnectError("simulated total outage")
+
+    monkeypatch.setattr(scraper, "fetch_raw_odds", always_failing_fetch_raw_odds)
+
+    generator = scraper.poll(interval_seconds=0.01)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(generator.__anext__(), timeout=0.5)
+
+    assert call_count >= 2  # at least one attempt per sport, across at least one full cycle
+
+
+@pytest.mark.asyncio
+async def test_poll_recovers_after_a_fully_failed_cycle(monkeypatch):
+    import httpx
+
+    scraper = EasybetScraper()
+    cycle = 0
+
+    async def fetch_raw_odds(sport):
+        nonlocal cycle
+        # First cycle (both sports) fails outright; second cycle succeeds.
+        if cycle < 2:
+            cycle += 1
+            raise httpx.ConnectError("simulated network blip")
+        return SAMPLE_RAW_PAYLOAD if sport == "football" else RUGBY_SAMPLE_RAW_PAYLOAD
+
+    monkeypatch.setattr(scraper, "fetch_raw_odds", fetch_raw_odds)
+
+    results = []
+    async for events in scraper.poll(interval_seconds=0.01):
+        results.append(events)
+        break
+
+    assert len(results) == 1
+    assert len(results[0]) == 2
