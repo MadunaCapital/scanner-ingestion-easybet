@@ -22,7 +22,9 @@ jobs:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       # Plain docker build+push on the runner itself, NOT `az acr build`:
-      # this subscription has ACR Tasks (remote builds) disabled by policy.
+      # the original Azure for Students subscription had ACR Tasks (remote
+      # builds) disabled by policy, and a runner build works on any
+      # subscription, so it stayed this way after the move to South Africa North.
       - name: Build image
         run: docker build -t $ACR_NAME.azurecr.io/$IMAGE_NAME:${{ github.sha }} -t $ACR_NAME.azurecr.io/$IMAGE_NAME:latest .
 
