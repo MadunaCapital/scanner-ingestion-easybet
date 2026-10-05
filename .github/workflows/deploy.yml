@@ -5,7 +5,7 @@ on:
     branches: [main]
 
 env:
-  ACR_NAME: arbitragescannerregistry
+  ACR_NAME: arbitragescannerregistryza
   IMAGE_NAME: scanner-ingestion-easybet
   CONTAINER_APP_NAME: arbitrage-scanner-easybet
   RESOURCE_GROUP: arbitrage-scanner-rg
